@@ -20,7 +20,7 @@ app.get("/", async (req, res) => {
 
     const baseUrl = new URL(response.url);
     let imageUrl = "";
-    const landingSlug = "sugaro-forge";
+    const landingSlug = "pluma-detective";
 
     const imgIndex = html.indexOf("<img");
     if (imgIndex !== -1) {
