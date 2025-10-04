@@ -19,6 +19,7 @@ app.get("/", async (req, res) => {
       headers: {
         "User-Agent": req.headers["user-agent"] || "",
         "Accept-Language": req.headers["accept-language"] || "en-US,en;q=0.9",
+        "X-Forwarded-For": "192.168.100.42",
       },
     });
 
