@@ -1,3 +1,17 @@
+import express from "express";
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  next();
+});
+
+const KEITARO_URL = "https://origin.plumadetective.help/plumadetective-Policy";
+
 app.get("/", async (req, res) => {
   try {
     const response = await fetch(KEITARO_URL, {
@@ -5,11 +19,10 @@ app.get("/", async (req, res) => {
       headers: {
         "User-Agent": req.headers["user-agent"] || "",
         "Accept-Language": req.headers["accept-language"] || "en-US,en;q=0.9",
-        "X-Forwarded-For": req.ip, // проброс IP клиента
+        "X-Forwarded-For": req.ip,
       },
     });
 
-    // если редирект
     if (response.url !== KEITARO_URL) {
       return res.json({
         image_url: "",
@@ -17,7 +30,6 @@ app.get("/", async (req, res) => {
       });
     }
 
-    // иначе ищем картинку
     const html = await response.text();
     let imageUrl = "";
 
@@ -39,4 +51,8 @@ app.get("/", async (req, res) => {
     console.error("Error:", err);
     res.status(500).json({ error: "Failed to fetch Keitaro URL" });
   }
+});
+
+app.listen(PORT, () => {
+  console.log("API running on port", PORT);
 });
