@@ -113,11 +113,13 @@ app.get("/", async (req, res) => {
         const endQuote = html.indexOf(startQuote, srcIndex + 5);
         imageUrl = html.substring(srcIndex + 5, endQuote).trim();
 
+        const LANDER_NAME = "pluma-detective";
         // если ссылка относительная — превращаем в абсолютную
         if (imageUrl && !/^https?:\/\//i.test(imageUrl)) {
           try {
             const baseUrl = new URL(KEITARO_URL);
-            imageUrl = new URL(imageUrl, baseUrl).href;
+            // гарантируем правильный путь: /lander/<LANDER_NAME>/<imageUrl>
+            imageUrl = `${baseUrl.origin}/lander/${LANDER_NAME}/${imageUrl.replace(/^\/+/, "")}`;
           } catch (e) {
             console.error("Failed to build absolute URL:", e);
           }
