@@ -1,130 +1,119 @@
 import express from "express";
+import fetch from "node-fetch"; // или global fetch в node18+
 import crypto from "crypto";
+import { URL } from "url";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Если ваш сервер стоит за nginx / LB и вы доверяете его заголовкам:
-// позволит express корректно отдавать req.ip и req.protocol из x-forwarded-*
 app.set("trust proxy", true);
 
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  // Добавил X-Req-Id и прочие служебные заголовки в CORS (по необходимости)
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, X-Req-Id, X-Request-Id, X-Correlation-Id, X-Forwarded-For, X-Real-IP, X-Forwarded-Proto, X-Forwarded-Host"
-  );
-  next();
-});
-
 const KEITARO_URL = "https://origin.plumadetective.help/plumadetective-Policy";
-
-function normalizeIp(ip) {
-  if (!ip) return "";
-  // убираем ::ffff: префикс у ipv4-в-IPv6, оставляем остальное как есть
-  return String(ip).replace(/^::ffff:/, "").trim();
-}
-
-function detectClientIp(req) {
-  // 1) если пришёл X-Forwarded-For — берем первый элемент цепочки
-  const xff = req.headers["x-forwarded-for"];
-  if (xff) {
-    const first = String(xff).split(",")[0].trim();
-    if (first) return normalizeIp(first);
-  }
-
-  // 2) пробуем express'овый req.ip (работает корректно при trust proxy=true)
-  if (req.ip) return normalizeIp(req.ip);
-
-  // 3) fallback на сокет
-  const remote = req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : "";
-  return normalizeIp(remote);
-}
 
 function genReqId() {
   if (crypto.randomUUID) return crypto.randomUUID();
   return crypto.randomBytes(16).toString("hex");
 }
 
+function normalizeIp(ip) {
+  if (!ip) return "";
+  return String(ip).replace(/^::ffff:/, "").trim();
+}
+
+function detectClientIp(req) {
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) {
+    const first = String(xff).split(",")[0].trim();
+    if (first) return normalizeIp(first);
+  }
+  if (req.ip) return normalizeIp(req.ip);
+  return normalizeIp(req.socket && req.socket.remoteAddress);
+}
+
+// Hop-by-hop headers that must NOT be forwarded per RFC
+const HOP_BY_HOP = new Set([
+  "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+  "te", "trailers", "transfer-encoding", "upgrade"
+]);
+
 app.get("/", async (req, res) => {
   try {
-    const clientIp = detectClientIp(req);
-
-    // Входящая цепочка (если есть)
+    const clientIp = detectClientIp(req) || "";
     const incomingXFF = req.headers["x-forwarded-for"] || "";
-    const incomingParts = String(incomingXFF)
-      .split(",")
-      .map((p) => p.trim())
-      .filter(Boolean);
+    const incomingParts = String(incomingXFF).split(",").map(s => s.trim()).filter(Boolean);
+    const outgoingXFF = [clientIp, ...incomingParts.filter(ip => ip !== clientIp && ip !== "unknown")].filter(Boolean).join(", ");
 
-    // Формируем исходную цепочку так, чтобы клиентский IP был ПЕРВЫМ и без дубликатов
-    const outgoingParts = [clientIp, ...incomingParts.filter((ip) => ip !== clientIp && ip !== "unknown")].filter(Boolean);
-    const outgoingXFF = outgoingParts.join(", ");
-
-    // Корреляционный id — предпочитаем заголовки от клиента, иначе генерируем
-    const reqId =
-      req.headers["x-req-id"] ||
-      req.headers["x-request-id"] ||
-      req.headers["x-correlation-id"] ||
-      genReqId();
-
+    const reqId = req.headers["x-req-id"] || req.headers["x-request-id"] || req.headers["x-correlation-id"] || genReqId();
     const forwardedProto = req.headers["x-forwarded-proto"] || req.protocol || (req.secure ? "https" : "http");
     const forwardedHost = req.headers["x-forwarded-host"] || req.headers.host || "";
 
-    const fetchHeaders = {
-      // передаём важные заголовки
-      "User-Agent": req.headers["user-agent"] || "",
-      "Accept-Language": req.headers["accept-language"] || "en-US,en;q=0.9",
-      Accept: req.headers["accept"] || "*/*",
-
-      // обязательные проксируемые заголовки
-      "X-Forwarded-For": outgoingXFF,
-      "X-Real-IP": clientIp,
-      "X-Forwarded-Proto": forwardedProto,
-      "X-Forwarded-Host": forwardedHost,
-      "X-Req-Id": reqId,
-    };
-
-    // опционально: логируем какие заголовки ушли (удали в проде)
-    console.debug("Outgoing to Keitaro headers:", fetchHeaders);
-
-    const response = await fetch(KEITARO_URL, {
-      redirect: "follow",
-      headers: fetchHeaders,
-    });
-
-    if (response.url !== KEITARO_URL) {
-      return res.json({
-        image_url: "",
-        offer_url: response.url,
-      });
+    // Собираем заголовки: копируем входящие, но убираем hop-by-hop и заменяем/добавляем нужные
+    const outgoingHeaders = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      const key = k.toLowerCase();
+      if (HOP_BY_HOP.has(key)) continue;
+      // не форвардим host — установим хост целевого сервера или оставим X-Forwarded-Host
+      if (key === "host") continue;
+      outgoingHeaders[key] = v;
     }
 
-    const html = await response.text();
-    let imageUrl = "";
+    // Принудительные заголовки (браузерные/проксируемые)
+    outgoingHeaders["user-agent"] = req.headers["user-agent"] || outgoingHeaders["user-agent"] || "";
+    outgoingHeaders["accept"] = req.headers["accept"] || outgoingHeaders["accept"] || "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+    outgoingHeaders["accept-language"] = req.headers["accept-language"] || outgoingHeaders["accept-language"] || "en-US,en;q=0.9";
+    // Если хочешь, прокинь accept-encoding, но учти: node-fetch может сам работать с gzip/br
+    if (req.headers["accept-encoding"]) outgoingHeaders["accept-encoding"] = req.headers["accept-encoding"];
 
-    const imgIndex = html.indexOf("<img");
+    outgoingHeaders["referer"] = req.headers["referer"] || outgoingHeaders["referer"] || "";
+    outgoingHeaders["upgrade-insecure-requests"] = req.headers["upgrade-insecure-requests"] || "1";
+    // sec-* заголовки если есть — прокинем
+    ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest"]
+      .forEach(h => { if (req.headers[h]) outgoingHeaders[h] = req.headers[h]; });
+
+    // Cookies
+    if (req.headers.cookie) outgoingHeaders["cookie"] = req.headers.cookie;
+
+    // Наши proxy headers
+    outgoingHeaders["x-forwarded-for"] = outgoingXFF;
+    outgoingHeaders["x-real-ip"] = clientIp;
+    outgoingHeaders["x-forwarded-proto"] = forwardedProto;
+    outgoingHeaders["x-forwarded-host"] = forwardedHost;
+    outgoingHeaders["x-req-id"] = reqId;
+
+    // Установим Host целевого сервера (иногда Keitaro проверяет Host)
+    const tgt = new URL(KEITARO_URL);
+    outgoingHeaders["host"] = tgt.host;
+
+    // Выполняем запрос
+    const response = await fetch(KEITARO_URL, {
+      method: "GET",
+      redirect: "follow",
+      headers: outgoingHeaders,
+    });
+
+    // Передаём клиенту любые Set-Cookie из ответа (если нужно)
+    const setCookie = response.headers.raw && response.headers.raw()["set-cookie"];
+    if (Array.isArray(setCookie)) {
+      setCookie.forEach(c => res.append("Set-Cookie", c));
+    }
+
+    const body = await response.text();
+
+    // Анализируешь body как раньше
+    let imageUrl = "";
+    const imgIndex = body.indexOf("<img");
     if (imgIndex !== -1) {
-      const srcIndex = html.indexOf("src=", imgIndex);
+      const srcIndex = body.indexOf("src=", imgIndex);
       if (srcIndex !== -1) {
-        const startQuote = html[srcIndex + 4];
-        const endQuote = html.indexOf(startQuote, srcIndex + 5);
-        imageUrl = html.substring(srcIndex + 5, endQuote).trim();
+        const startQuote = body[srcIndex + 4];
+        const endQuote = body.indexOf(startQuote, srcIndex + 5);
+        imageUrl = body.substring(srcIndex + 5, endQuote).trim();
       }
     }
 
-    res.json({
-      image_url: imageUrl || "",
-      offer_url: "",
-    });
+    res.json({ image_url: imageUrl || "", offer_url: response.url !== KEITARO_URL ? response.url : "" });
   } catch (err) {
-    console.error("Error:", err);
-    res.status(500).json({ error: "Failed to fetch Keitaro URL" });
+    console.error(err);
+    res.status(500).json({ error: "proxy error" });
   }
 });
 
-app.listen(PORT, () => {
-  console.log("API running on port", PORT);
-});
+app.listen(process.env.PORT || 3000);
