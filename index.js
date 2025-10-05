@@ -112,8 +112,19 @@ app.get("/", async (req, res) => {
         const startQuote = html[srcIndex + 4];
         const endQuote = html.indexOf(startQuote, srcIndex + 5);
         imageUrl = html.substring(srcIndex + 5, endQuote).trim();
+
+        // если ссылка относительная — превращаем в абсолютную
+        if (imageUrl && !/^https?:\/\//i.test(imageUrl)) {
+          try {
+            const baseUrl = new URL(KEITARO_URL);
+            imageUrl = new URL(imageUrl, baseUrl).href;
+          } catch (e) {
+            console.error("Failed to build absolute URL:", e);
+          }
+        }
       }
     }
+
 
     res.json({
       image_url: imageUrl || "",
